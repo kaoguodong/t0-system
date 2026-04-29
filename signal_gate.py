@@ -33,8 +33,11 @@ GATE_RULES = {
     "rr_bonus_threshold": 2.0,
     "rr_bonus_factor": 0.25,
     # 止损
-    "stop_loss_pct": 0.10,    # 区间下方10%
-    "stop_loss_min_pct": 0.01,  # 最小止损空间：1%（失真检测阈值）
+    "stop_loss_pct": 0.10,     # 区间下方10%
+    "stop_loss_min_pct": 0.012,  # 最小止损空间：1.2%（给噪音留空间）
+    # RR可信度
+    "rr_confidence_risk_threshold": 0.008,  # 止损<0.8%价格 → LOW
+    "position_modifier_low_rr": 0.65,         # LOW置信度 → 仓位再打65折
     # 频率控制
     "max_trades_per_day": 2,
     "cooldown_minutes": 30,
@@ -134,6 +137,21 @@ class RiskReward:
     position_modifier: float    # 仓位修正系数
     stop_loss_pct: float        # 止损比例（%）
     rr_flag: str = "NORMAL"     # NORMAL / FAKE_RR / SUSPICIOUS
+    confidence: str = "UNKNOWN" # LOW / MEDIUM / HIGH (RR可信度)
+
+
+def rr_confidence(risk_pct: float, trend: str) -> str:
+    """
+    RR可信度评分
+    ===============
+    risk_pct: 止损距离占买价比例（如0.012 = 1.2%）
+    trend: "UP" | "DOWN"
+    """
+    if risk_pct < GATE_RULES["rr_confidence_risk_threshold"]:
+        return "LOW"      # 止损过紧，假RR风险
+    if trend == "DOWN":
+        return "MEDIUM"   # 逆趋势，胜率压低
+    return "HIGH"         # 趋势+止损结构均健康
 
 
 def calc_risk_reward(buy1: float, sell1: float, H: float, L: float,
@@ -141,31 +159,30 @@ def calc_risk_reward(buy1: float, sell1: float, H: float, L: float,
     """
     计算RR（盈亏比）和自动止损
     ==============================
-    止损 = buy1 - R * 10%，但必须保证最小1%空间（否则拓宽）
+    止损 = buy1 - R * 10%，但必须保证最小1.2%空间（否则拓宽）
+    核心规则：RR决定有没有交易价值，趋势决定能不能加仓
 
     RR质量检测：
     - 止损距离 < 0.8% 价格 → FAKE_RR（失真）
     - RR > 5 → SUSPICIOUS（高概率失真）
-    - 趋势向下时 → 即使RR高也不能加仓
+    - 趋势向下 → MEDIUM置信度
 
-    决策：
-    - RR < 1.5  → SKIP
-    - RR失真   → SKIP 或 降仓70%
-    - RR正常   → 正常仓位
-    - RR>2 + 趋势向上 → 可加仓
-    - RR>2 + 趋势向下 → 不加仓
+    仓位修正：
+    - HIGH + 趋势向上 + RR>2 → +25%（可加仓）
+    - HIGH + 趋势向下        → 正常仓位（不加仓）
+    - MEDIUM                 → 正常仓位
+    - LOW（FAKE_RR）         → 原始仓位打65折
     """
     R = H - L
     raw_sl = buy1 - R * GATE_RULES["stop_loss_pct"]
     raw_sl_dist = abs(buy1 - raw_sl)
-    raw_sl_pct = raw_sl_dist / buy1
-
-    # ── 确保最小止损空间（1%）──
     min_sl_dist = buy1 * GATE_RULES["stop_loss_min_pct"]
+
+    # ── 确保最小止损空间（1.2%，给噪音留足）──
     if raw_sl_dist < min_sl_dist:
         sl_price = round(buy1 - min_sl_dist, 2)
         sl_dist = min_sl_dist
-        widen_note = "(已拓宽至1%)"
+        widen_note = "(已拓宽至1.2%%)"
     else:
         sl_price = round(raw_sl, 2)
         sl_dist = raw_sl_dist
@@ -173,7 +190,7 @@ def calc_risk_reward(buy1: float, sell1: float, H: float, L: float,
 
     tp_price = sell1
     tp_distance = abs(tp_price - buy1)
-    sl_pct = sl_dist / buy1
+    sl_pct = sl_dist / buy1  # 止损占买价比例
 
     if sl_dist <= 0:
         return RiskReward(
@@ -182,42 +199,53 @@ def calc_risk_reward(buy1: float, sell1: float, H: float, L: float,
             verdict="SKIP", verdict_reason="区间过窄，无法计算有效止损",
             position_modifier=0.0, stop_loss_pct=sl_pct,
             rr_flag="NORMAL",
+            confidence="LOW",
         )
 
     rr = tp_distance / sl_dist
 
-    # ── RR质量检测（核心修正）──
-    rr_ratio = sl_dist / buy1  # 止损占价格比
-    if rr_ratio < 0.008:
+    # ── RR质量标签 ──
+    if sl_pct < GATE_RULES["rr_confidence_risk_threshold"]:
         rr_flag = "FAKE_RR"
     elif rr > 5:
         rr_flag = "SUSPICIOUS"
     else:
         rr_flag = "NORMAL"
 
-    # ── 决策（趋势权重 > RR权重）──
+    # ── 趋势方向 ──
+    trend_label = "UP" if above_ma5 else "DOWN"
+
+    # ── RR可信度 ──
+    confidence = rr_confidence(sl_pct, trend_label)
+
+    # ── 决策（RR决定有没有价值，趋势决定能不能加仓）──
+    # 顺序重要：先排除无效RR，再处理MEDIUM+downtrend，最后才是RR加仓
     if rr < GATE_RULES["rr_min"]:
         verdict = "SKIP"
         verdict_reason = "RR %.1f < %.1f，不划算" % (rr, GATE_RULES["rr_min"])
         position_modifier = 0.0
     elif rr_flag == "FAKE_RR":
         verdict = "WARN"
-        verdict_reason = ("RR %.1f 失真（止损仅%.1f%%，小于0.8%%）" % (rr, rr_ratio * 100)) + widen_note
-        position_modifier = -0.30  # 降30%仓位
+        verdict_reason = ("RR %.1f 失真（止损仅%.1f%%，小于0.8%%）" % (rr, sl_pct * 100)) + widen_note
+        position_modifier = GATE_RULES["position_modifier_low_rr"] - 1.0  # -0.35 → 打65折
     elif rr_flag == "SUSPICIOUS":
         verdict = "WARN"
-        verdict_reason = ("RR %.1f 可疑（>5通常失真，止损过近）" % rr) + widen_note
-        position_modifier = 0.0    # 不加不减
+        verdict_reason = ("RR %.1f 可疑（>5通常失真）" % rr) + widen_note
+        position_modifier = 0.0
+    elif confidence == "MEDIUM" and not above_ma5:
+        # MEDIUM + 逆趋势：降权20%（先于RR加仓判断，防止被rr>=2.0覆盖）
+        verdict = "WARN"
+        verdict_reason = ("RR %.1f 正常但逆趋势，胜率压低" % rr) + widen_note
+        position_modifier = -0.20
     elif rr >= GATE_RULES["rr_bonus_threshold"]:
-        if not above_ma5:
-            # 趋势向下：RR高也不加仓，只当正常信号处理
+        if confidence == "HIGH" and above_ma5:
+            verdict = "DO"
+            verdict_reason = ("RR %.1f 优质，趋势向上，可加仓" % rr) + widen_note
+            position_modifier = GATE_RULES["rr_bonus_factor"]  # +0.25
+        else:
             verdict = "DO"
             verdict_reason = ("RR %.1f 优秀但逆趋势，不加仓" % rr) + widen_note
             position_modifier = 0.0
-        else:
-            verdict = "DO"
-            verdict_reason = ("RR %.1f 优质，趋势向上，可加仓" % rr) + widen_note
-            position_modifier = GATE_RULES["rr_bonus_factor"]
     else:
         verdict = "DO"
         verdict_reason = ("RR %.1f 正常" % rr) + widen_note
@@ -232,8 +260,9 @@ def calc_risk_reward(buy1: float, sell1: float, H: float, L: float,
         verdict=verdict,
         verdict_reason=verdict_reason,
         position_modifier=position_modifier,
-        stop_loss_pct=round(sl_pct * 100, 2),  # 百分比
+        stop_loss_pct=round(sl_pct * 100, 2),
         rr_flag=rr_flag,
+        confidence=confidence,
     )
 
 
@@ -439,6 +468,7 @@ def calc_signal_gate(snap: MarketSnapshot, df: pd.DataFrame | None = None) -> di
         "rr_flag": getattr(rr_result, "rr_flag", "NORMAL"),
         "rr_verdict": rr_result.verdict if rr_result else "SKIP",
         "rr_reason": rr_result.verdict_reason if rr_result else "",
+        "rr_confidence": rr_result.confidence if rr_result else "UNKNOWN",
         "tp_price": rr_result.tp_price if rr_result else 0.0,
         "sl_price": rr_result.sl_price if rr_result else 0.0,
         "sl_distance": round(rr_result.sl_distance, 2) if rr_result else 0.0,

@@ -75,6 +75,7 @@ def format_signal(s: dict) -> str:
     rr_flag = s.get("rr_flag", "NORMAL")       # NORMAL / FAKE_RR / SUSPICIOUS
     rr_reason = s.get("rr_reason", "")
     pos_pct = int(s["position_ratio"] * 100)
+    stop_loss_warning = ""  # 提前初始化，防止UnboundLocalError
 
     # ── 判定结论 ──
     if rr_verdict == "SKIP" or pos_pct == 0:
@@ -94,8 +95,24 @@ def format_signal(s: dict) -> str:
         verdict_icon = "SKIP"
         pos_label = "0%"
 
+    # ── 结论文字 ──
+    if verdict_icon == "SKIP":
+        verdict_text = "X 不做"
+    elif verdict_icon == "WARN":
+        verdict_text = "WARN 轻仓做T（" + str(pos_pct) + "%）"
+        if stop_loss_warning:
+            verdict_text += "，" + stop_loss_warning
+    else:
+        if pos_pct <= 20:
+            verdict_text = "GO 小仓做T（" + str(pos_pct) + "%）"
+        elif pos_pct >= 45:
+            verdict_text = "GO 做T（" + str(pos_pct) + "%）"
+        else:
+            verdict_text = "GO 做T（" + str(pos_pct) + "%）"
+
     # ── 收集原因 ──
     reasons = []
+    stop_loss_warning = ""
 
     if s["gate_passed"]:
         gates = s.get("gates", {})
@@ -110,10 +127,17 @@ def format_signal(s: dict) -> str:
             reasons.append("波动不足（%.2f%% < 4%%）" % amp_pct)
 
         # RR质量
+        rr_conf = s.get("rr_confidence", "UNKNOWN")
         if rr_flag == "FAKE_RR":
             reasons.append("盈亏比失真（止损过近，RR=%.1f无效）" % rr)
+            stop_loss_warning = "止损过紧（%.1f%%），建议拓宽" % s.get("stop_loss_pct", 0)
         elif rr_flag == "SUSPICIOUS":
             reasons.append("盈亏比可疑（RR=%.1f>5，疑似失真）" % rr)
+        elif rr_conf == "LOW":
+            reasons.append("盈亏比可信度低（止损仅%.1f%%，小于0.8%%）" % s.get("stop_loss_pct", 0))
+            stop_loss_warning = "止损过紧，建议拓宽至约1.2%%以上"
+        elif rr_conf == "MEDIUM" and not s.get("above_ma5"):
+            reasons.append("盈亏比可信度中等（逆趋势，胜率压低）")
         elif rr >= GATE_RULES["rr_bonus_threshold"]:
             reasons.append("盈亏比优秀（RR=%.1f > 2.0）" % rr)
         elif rr >= GATE_RULES["rr_min"]:
@@ -127,6 +151,11 @@ def format_signal(s: dict) -> str:
         else:
             reasons.append("处于MA5下方（逆趋势 -> 降仓）")
 
+        # 止损过紧警告
+        sl_pct = s.get("stop_loss_pct", 0)
+        if sl_pct > 0 and sl_pct < 1.0 and stop_loss_warning == "":
+            stop_loss_warning = "止损偏紧（%.1f%%），建议拓宽至1.2%%以上" % sl_pct
+
     else:
         gates = s.get("gates", {})
         if gates.get("G2", {}).get("pass") is False:
@@ -139,28 +168,18 @@ def format_signal(s: dict) -> str:
         if not reasons:
             reasons.append(s.get("reject_reason", "门禁拒绝"))
 
-    # ── 操作区间 ──
+    # ── 操作区间（第二次定义，覆盖上面的空壳）──
     if s["gate_passed"] and rr_verdict != "SKIP":
         op_lines = []
         op_lines.append("  买：" + str(buy1) + " 附近")
         op_lines.append("  卖：" + str(sell1) + " 附近")
-        op_lines.append("  止损：" + str(sl_price) + " 附近")
+        op_lines.append("  止损：" + str(sl_price) + " 附近（" +
+                        ("%.1f%%" % s.get("stop_loss_pct", 0)) + "）")
+        if stop_loss_warning:
+            op_lines.append("  ！建议：" + stop_loss_warning)
         op_str = "\n".join(op_lines)
     else:
         op_str = "  观望，不操作"
-
-    # ── 结论文字 ──
-    if verdict_icon == "SKIP":
-        verdict_text = "X 不做"
-    elif verdict_icon == "WARN":
-        verdict_text = "WARN 轻仓做T（" + str(pos_pct) + "%）"
-    else:
-        if pos_pct <= 25:
-            verdict_text = "GO 小仓做T（" + str(pos_pct) + "%）"
-        elif pos_pct >= 45:
-            verdict_text = "GO 做T（" + str(pos_pct) + "%）"
-        else:
-            verdict_text = "GO 做T（" + str(pos_pct) + "%）"
 
     # ── 组装 ──
     parts = []
