@@ -119,13 +119,28 @@ def _get_daily_df_tushare(code: str, days: int = 60) -> pd.DataFrame:
         params={"ts_code": ts_code, "start_date": start_date, "end_date": end_date},
         fields="ts_code,trade_date,open,high,low,close,vol,amount,pct_chg"
     )
-    df = df.rename(columns={"vol": "volume", "pct_chg": "pct_change"})
-    df["date"] = pd.to_datetime(df["date"], format="%Y%m%d")
+
+    # 安全检查：确保trade_date列存在
+    if "trade_date" not in df.columns:
+        raise ConnectionError(f"Tushare返回缺少trade_date列，字段: {list(df.columns)}")
+    if len(df) == 0:
+        raise ConnectionError(f"Tushare返回空数据: {code}")
+
+    df = df.rename(columns={"trade_date": "date", "vol": "volume", "pct_chg": "pct_change"})
+
+    # 日期列必须是字符串 "YYYYMMDD" 格式
+    df["date"] = pd.to_datetime(df["date"], format="%Y%m%d", errors="coerce")
+    if df["date"].isna().all():
+        raise ConnectionError(f"日期解析全失败，原始值: {df['date'].tolist()[:5]}")
+
     df = df.sort_values("date").reset_index(drop=True)
-    df = df[df["volume"] > 0].reset_index(drop=True)
 
     for col in ["open", "high", "low", "close", "volume"]:
         df[col] = pd.to_numeric(df[col], errors='coerce')
+
+    # 过滤停牌（volume为0或NaN）
+    df = df[df["volume"].notna() & (df["volume"] > 0)].reset_index(drop=True)
+
     return df
 
 
@@ -140,7 +155,7 @@ def get_daily_df(code: str, days: int = 60) -> Tuple[pd.DataFrame, str]:
     except ConnectionError as e:
         raise ConnectionError(f"数据获取失败: {e}")
 
-    latest_date = df.iloc[-1]["date"]
+    latest_date = pd.Timestamp(df.iloc[-1]["date"])
     today = datetime.now().date()
     date_status = "latest" if latest_date.date() == today else "stale"
 
