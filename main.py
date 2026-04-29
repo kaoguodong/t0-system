@@ -18,7 +18,7 @@ import schedule
 
 sys.path.insert(0, os.path.dirname(__file__))
 
-from config import STOCKS, WEBHOOK, CAPITAL, T_POSITION_RATIO, SCHEDULE_TIME
+from config import STOCKS, WEBHOOK, CAPITAL, T_POSITION_RATIO, SCHEDULE_TIME, SCHEDULE_TIMES
 from market_data import fetch_market_snapshot, MarketSnapshot
 from signal_gate import calc_signal_gate, GATE_RULES, get_freq_status
 from backtest import backtest, print_backtest_report
@@ -203,12 +203,38 @@ def run_once():
 
 
 # ────────────────────────── 调度器 ──────────────────────────
+def run_intraday_signal():
+    """日内盘中信号（使用统一数据层 + 频率控制）"""
+    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+    lines = []
+    lines.append("=== T0 Signal v3.2.1 [INTRA] === " + now + " ===")
+    lines.append("[UNIFIED] Single price | Freq control | Dedup active")
+
+    for name, code in STOCKS.items():
+        sig = gen_signal(name, code)
+        lines.append(format_signal(sig))
+
+    footer = [
+        "----------------------------",
+        "INTRA: Score>=3 + Amp>=4% -> Both required",
+        "Position: Score4=50% | Score3+MA5above=30% | Score3+MA5below=25%",
+        "Freq: Max 2/day | 30min cooldown | 5min dedup",
+    ]
+    lines.extend(footer)
+    msg = "\n".join(lines)
+    push(msg)
+    return True
+
+
 def start_scheduler():
-    schedule.every().day.at(SCHEDULE_TIME).do(run_daily_signal)
+    """多时段调度：日内盘中信号"""
+    for t in SCHEDULE_TIMES:
+        schedule.every().day.at(t).do(run_intraday_signal)
+
     banner = [
         "========================================",
-        "  T0 Signal v3.2.1 - Started",
-        "  Schedule: Daily " + SCHEDULE_TIME + " CST",
+        "  T0 Signal v3.2.1 - Scheduler Started",
+        "  Intraday slots: " + ", ".join(SCHEDULE_TIMES),
         "  Stocks: " + ", ".join(STOCKS.keys()),
         "  Freq: 2 trades/day max | 30min cooldown",
         "  Dedup: 5min silence on repeat signals",
@@ -223,7 +249,8 @@ def start_scheduler():
 # ────────────────────────── 入口 ──────────────────────────
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="T0 Signal v3.2.1")
-    parser.add_argument("--once", action="store_true", help="Run once and push")
+    parser.add_argument("--once", action="store_true", help="Run once and push (收盘信号)")
+    parser.add_argument("--intraday", action="store_true", help="Run intraday scheduler (盘中多时段)")
     parser.add_argument("--backtest", action="store_true", help="Backtest mode")
     args = parser.parse_args()
 
@@ -231,5 +258,7 @@ if __name__ == "__main__":
         run_backtest()
     elif args.once:
         run_once()
-    else:
+    elif args.intraday:
         start_scheduler()
+    else:
+        start_scheduler()  # 默认走日内多时段
