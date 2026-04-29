@@ -1,14 +1,11 @@
 #!/usr/bin/env python3
 """
-做T信号系统 v3.1 工业级 · 主程序
+做T信号系统 v3.2.1 · 主程序
 =================================
-核心升级：
-- 统一行情层（Single Source of Truth）：MarketSnapshot
-- 时间锁：信号5分钟过期机制
-- 价格口径统一：门禁/信号/执行均用同一价格基准
-调度：每日 15:10（北京时间）自动推送
-手动运行：python main.py --once
-回测模式：python main.py --backtest
+升级：交易频率控制 + 信号去重 + 统一价格展示
+手动：python main.py --once
+回测：python main.py --backtest
+调度：每日 15:10 CST
 """
 
 import os
@@ -23,7 +20,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 
 from config import STOCKS, WEBHOOK, CAPITAL, T_POSITION_RATIO, SCHEDULE_TIME
 from market_data import fetch_market_snapshot, MarketSnapshot
-from signal_gate import calc_signal_gate, GATE_RULES
+from signal_gate import calc_signal_gate, GATE_RULES, get_freq_status
 from backtest import backtest, print_backtest_report
 
 
@@ -49,12 +46,8 @@ def push(msg: str):
     push_to_feishu(msg)
 
 
-# ────────────────────────── 信号生成（统一数据层） ──────────────────────────
+# ────────────────────────── 信号生成 ──────────────────────────
 def gen_signal(name: str, code: str) -> dict:
-    """
-    数据层 -> 统一行情快照 -> 门禁系统 -> 信号输出
-    所有价格来自同一个 MarketSnapshot，不再混用
-    """
     try:
         snap = fetch_market_snapshot(code, name)
     except Exception as e:
@@ -68,56 +61,71 @@ def gen_signal(name: str, code: str) -> dict:
 
 
 def format_signal(s: dict) -> str:
-    """格式化为飞书推送文本"""
+    """格式化输出（v3.2.1：统一价格展示，无多价格混用）"""
     if "error" in s:
         return "\n【" + s["name"] + " " + s["code"] + "】ERROR: " + s["error"]
 
     snap = s.get("snap")
 
-    # 基本状态
-    date_flag = "OK(Today)" if not s.get("is_expired") else "WARNING(Stale)"
-    realtime_icon = "RT" if s["is_realtime"] else "NRT"
-    age = s.get("data_age", "")
+    # ── 数据新鲜度 ──
+    if s.get("is_expired"):
+        date_flag = "STALE"
+    else:
+        date_flag = "CURRENT"
 
-    # 门禁
+    # ── 门禁 ──
     gate_passed = s["gate_passed"]
     if gate_passed:
         gate_str = "GATE PASS"
     else:
         gate_str = "GATE REJECT: " + str(s.get("reject_reason", ""))
 
-    # 仓位
+    # ── 仓位 ──
     pos_pct = int(s["position_ratio"] * 100)
     if pos_pct >= 40:
-        pos_icon = "HIGH"
+        pos_icon = "[HIGH]"
     elif pos_pct >= 20:
-        pos_icon = "MED"
+        pos_icon = "[MED]"
     else:
-        pos_icon = "LOW"
+        pos_icon = "[LOW]"
 
-    # 区间
+    # ── 区间 ──
     buy1, buy2 = s["buy"]
     sell1, sell2 = s["sell"]
 
-    # 价格说明
-    if snap and snap.is_realtime:
-        price_note = ("RT:" + str(s["current_price"]) + " (" +
-                      s["price_source"] + ") Prev:" + str(s["close"]))
-    else:
-        price_note = "Prev:" + str(s["close"])
+    # ── 统一价格（唯一价格，无多价格展示） ──
+    # v3.2.1: 只展示一个价格，不再混用RT/Prev/Sina多个标签
+    unified_price = s.get("unified_price", 0)
+    price_label = s.get("price_label", "Unified")
+    price_note = ("Unified Price: %.2f" % unified_price)
 
-    # 门禁明细
+    # ── 频率状态 ──
+    freq = s.get("freq_display", "")
+    freq_status = s.get("freq_status", {})
+    remaining = freq_status.get("remaining", 0)
+
+    # ── 趋势标签 ──
+    trend = s.get("trend_label", "")
+    trend_note = (" [MA5 above]" if s.get("above_ma5") else " [MA5 below]")
+
+    # ── 去重状态 ──
+    if s.get("push_suppressed"):
+        push_note = " [SUPPRESSED - dedup active]"
+    else:
+        push_note = ""
+
+    # ── 过期警告 ──
+    expired_warn = ""
+    if s.get("is_expired"):
+        expired_warn = "\n  WARNING: Data expired (" + s.get("data_age", "") + ")"
+
+    # ── 门禁明细 ──
     gate_lines = []
     for gate_id, g in s.get("gates", {}).items():
         icon = "[OK]" if g["pass"] else "[REJ]"
         gate_lines.append("  " + icon + " " + g["value"])
 
-    # 时间锁
-    expired_warn = ""
-    if s.get("is_expired"):
-        expired_warn = "\n  WARNING: Data expired (" + age + ")"
-
-    # 组装
+    # ── 组装 ──
     amp = s.get("amplitude", 0)
     pct = s.get("pct_change", 0)
     score = s["score"]
@@ -125,16 +133,17 @@ def format_signal(s: dict) -> str:
     used_capital = int(CAPITAL * s["position_ratio"])
 
     parts = []
-    parts.append("\n【" + s["name"] + "】" + str(s.get("data_date", "")) + " " + date_flag)
-    parts.append("  Price: " + price_note + " " + realtime_icon + expired_warn)
+    parts.append("\n【" + s["name"] + "】" + str(s.get("data_date", "")) + " " + date_flag + push_note)
+    parts.append("  " + price_note + " (" + price_label + ")" + trend_note + expired_warn)
     parts.append("  Score: " + str(score) + "/" + str(max_score) + " -> " + gate_str)
     parts.append("  Position: " + pos_icon + " " + str(pos_pct) + "% (use " + str(used_capital) + " CNY)")
     parts.append("  BUY zone: " + str(buy1) + " ~ " + str(buy2))
     parts.append("  SELL zone: " + str(sell1) + " ~ " + str(sell2))
     parts.append("  Amp: " + ("%.2f%%" % (amp * 100)) + " | Chg: " + ("%+.2f%%" % pct))
+    parts.append("  Freq: " + freq + " (remaining: " + str(remaining) + ")")
     parts.append("  --- Gate Details ---")
     parts.extend(gate_lines)
-    parts.append("  Fetched: " + age)
+    parts.append("  Fetched: " + s.get("data_age", ""))
 
     return "\n".join(parts)
 
@@ -143,8 +152,8 @@ def format_signal(s: dict) -> str:
 def run_daily_signal():
     now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
     lines = []
-    lines.append("=== T0 Signal v3.1 === " + now + " ===")
-    lines.append("[UNIFIED] All prices from single source, no mixing")
+    lines.append("=== T0 Signal v3.2.1 === " + now + " ===")
+    lines.append("[UNIFIED] Single price source | Freq control | Dedup filter")
 
     for name, code in STOCKS.items():
         print("\nProcessing: " + name + " (" + code + ")...")
@@ -153,10 +162,10 @@ def run_daily_signal():
 
     footer = [
         "----------------------------",
-        "RULE: Score>=3 + Amp>=4% -> Both required to trade",
-        "Position: Score4=50%, Score3=30% (reduced)",
-        "TTL: Signal expires after 5 minutes",
-        "SOURCE: All prices unified (RT + PrevClose from same batch)",
+        "RULE: Score>=3 + Amp>=4% -> Both required",
+        "Position: Score4=50% | Score3+MA5above=30% | Score3+MA5below=25%",
+        "Freq: Max 2 trades/day | 30min cooldown | 5min dedup",
+        "Trend: MA5below = counter-trend, reduced position",
         "NEXT: Tomorrow " + SCHEDULE_TIME + " CST",
     ]
     lines.extend(footer)
@@ -170,7 +179,7 @@ def run_daily_signal():
 def run_backtest():
     sep = "=" * 50
     print("\n" + sep)
-    print("  BACKTEST MODE (v3.1 unified)")
+    print("  BACKTEST MODE (v3.2.1)")
     print(sep)
     for name, code in STOCKS.items():
         print("\n> Backtest: " + name + " (" + code + ")")
@@ -198,10 +207,11 @@ def start_scheduler():
     schedule.every().day.at(SCHEDULE_TIME).do(run_daily_signal)
     banner = [
         "========================================",
-        "  T0 Signal v3.1 - Started",
+        "  T0 Signal v3.2.1 - Started",
         "  Schedule: Daily " + SCHEDULE_TIME + " CST",
         "  Stocks: " + ", ".join(STOCKS.keys()),
-        "  Signal TTL: 5 minutes",
+        "  Freq: 2 trades/day max | 30min cooldown",
+        "  Dedup: 5min silence on repeat signals",
         "========================================",
     ]
     print("\n".join(banner))
@@ -212,7 +222,7 @@ def start_scheduler():
 
 # ────────────────────────── 入口 ──────────────────────────
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="T0 Signal v3.1")
+    parser = argparse.ArgumentParser(description="T0 Signal v3.2.1")
     parser.add_argument("--once", action="store_true", help="Run once and push")
     parser.add_argument("--backtest", action="store_true", help="Backtest mode")
     args = parser.parse_args()
