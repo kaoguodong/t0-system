@@ -61,6 +61,7 @@ def gen_signal(name: str, code: str) -> dict:
 def format_signal(s: dict) -> str:
     """
     v3.3 人话格式：结论 + 原因（简洁列表式）
+    核心逻辑：趋势权重 > RR权重，RR失真直接降权
     """
     if "error" in s:
         return "\n【" + s["name"] + " " + s["code"] + "】ERROR: " + s["error"]
@@ -70,44 +71,35 @@ def format_signal(s: dict) -> str:
     sell1, sell2 = s["sell"]
     rr = s.get("rr", 0)
     sl_price = s.get("sl_price", 0)
+    rr_verdict = s.get("rr_verdict", "SKIP")   # DO / WARN / SKIP
+    rr_flag = s.get("rr_flag", "NORMAL")       # NORMAL / FAKE_RR / SUSPICIOUS
+    rr_reason = s.get("rr_reason", "")
     pos_pct = int(s["position_ratio"] * 100)
-    reject = s.get("reject_reason") or ""
 
     # ── 判定结论 ──
-    if s["gate_passed"]:
-        if rr >= GATE_RULES["rr_bonus_threshold"]:
-            verdict_icon = "GO"  # 正常/加仓
-            pos_label = str(pos_pct) + "%"
-        elif rr >= GATE_RULES["rr_min"]:
-            verdict_icon = "GO"  # 正常
+    if rr_verdict == "SKIP" or pos_pct == 0:
+        verdict_icon = "SKIP"
+        pos_label = "0%"
+    elif rr_verdict == "WARN":
+        verdict_icon = "WARN"
+        pos_label = str(pos_pct) + "%"
+    elif rr_verdict == "DO":
+        if rr >= GATE_RULES["rr_bonus_threshold"] and s.get("above_ma5"):
+            verdict_icon = "GO"
             pos_label = str(pos_pct) + "%"
         else:
-            verdict_icon = "SKIP"
-            pos_label = "0%"
+            verdict_icon = "GO"
+            pos_label = str(pos_pct) + "%"
     else:
         verdict_icon = "SKIP"
         pos_label = "0%"
-
-    # ── 判定图标 ──
-    if verdict_icon == "SKIP":
-        icon = "X"
-    elif pos_pct >= 45:
-        icon = "GO"
-    else:
-        icon = "GO"
-
-    verdict_text = "X" if verdict_icon == "SKIP" else str(pos_pct) + "%"
 
     # ── 收集原因 ──
     reasons = []
 
     if s["gate_passed"]:
-        # 通过的原因
         gates = s.get("gates", {})
-        g1 = gates.get("G1", {})
         g2 = gates.get("G2", {})
-        g3 = gates.get("G3", {})
-        g4 = gates.get("G4", {})
 
         # 振幅
         if g2["pass"]:
@@ -117,13 +109,17 @@ def format_signal(s: dict) -> str:
             amp_pct = s["amplitude"] * 100
             reasons.append("波动不足（%.2f%% < 4%%）" % amp_pct)
 
-        # RR
-        if rr >= GATE_RULES["rr_bonus_threshold"]:
-            reasons.append("盈亏比优秀（RR = %.1f > 2.0）" % rr)
+        # RR质量
+        if rr_flag == "FAKE_RR":
+            reasons.append("盈亏比失真（止损过近，RR=%.1f无效）" % rr)
+        elif rr_flag == "SUSPICIOUS":
+            reasons.append("盈亏比可疑（RR=%.1f>5，疑似失真）" % rr)
+        elif rr >= GATE_RULES["rr_bonus_threshold"]:
+            reasons.append("盈亏比优秀（RR=%.1f > 2.0）" % rr)
         elif rr >= GATE_RULES["rr_min"]:
-            reasons.append("盈亏比合格（RR = %.1f）" % rr)
+            reasons.append("盈亏比合格（RR=%.1f）" % rr)
         else:
-            reasons.append("盈亏比不成立（RR = %.1f < 1.5）" % rr)
+            reasons.append("盈亏比不足（RR=%.1f < 1.5）" % rr)
 
         # 趋势
         if s.get("above_ma5"):
@@ -132,20 +128,19 @@ def format_signal(s: dict) -> str:
             reasons.append("处于MA5下方（逆趋势 -> 降仓）")
 
     else:
-        # 拒绝原因
         gates = s.get("gates", {})
-        if "振幅" in reject or gates.get("G2", {}).get("pass") is False:
+        if gates.get("G2", {}).get("pass") is False:
             amp_pct = s["amplitude"] * 100
             reasons.append("波动不足（%.2f%% < 4%%）" % amp_pct)
-        if "RR" in reject or "rr" in reject.lower():
-            reasons.append("盈亏比不成立（RR < 1.5）")
-        if "评分" in reject:
-            reasons.append("评分不足（" + reject + "）")
+        if "RR" in s.get("reject_reason", "") or "rr" in s.get("reject_reason", "").lower():
+            reasons.append("盈亏比不成立")
+        if "评分" in s.get("reject_reason", ""):
+            reasons.append("评分不足")
         if not reasons:
-            reasons.append(reject)
+            reasons.append(s.get("reject_reason", "门禁拒绝"))
 
     # ── 操作区间 ──
-    if s["gate_passed"]:
+    if s["gate_passed"] and rr_verdict != "SKIP":
         op_lines = []
         op_lines.append("  买：" + str(buy1) + " 附近")
         op_lines.append("  卖：" + str(sell1) + " 附近")
@@ -154,13 +149,23 @@ def format_signal(s: dict) -> str:
     else:
         op_str = "  观望，不操作"
 
+    # ── 结论文字 ──
+    if verdict_icon == "SKIP":
+        verdict_text = "X 不做"
+    elif verdict_icon == "WARN":
+        verdict_text = "WARN 轻仓做T（" + str(pos_pct) + "%）"
+    else:
+        if pos_pct <= 25:
+            verdict_text = "GO 小仓做T（" + str(pos_pct) + "%）"
+        elif pos_pct >= 45:
+            verdict_text = "GO 做T（" + str(pos_pct) + "%）"
+        else:
+            verdict_text = "GO 做T（" + str(pos_pct) + "%）"
+
     # ── 组装 ──
     parts = []
     parts.append("【" + s["name"] + "】")
-    parts.append("结论：" + ("X" if verdict_icon == "SKIP" else "GO") +
-                 (" 不做" if verdict_icon == "SKIP" else
-                  (" 小仓做T（" + str(pos_pct) + "%）" if pos_pct <= 30 else
-                   (" 做T（" + str(pos_pct) + "%）"))))
+    parts.append("结论：" + verdict_text)
     parts.append("原因：")
     for r in reasons:
         parts.append("- " + r)

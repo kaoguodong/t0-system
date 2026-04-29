@@ -25,15 +25,16 @@ GATE_RULES = {
     "amplitude_min": 0.04,
     "volume_ratio_min": 0.6,
     # 仓位规则（趋势感知）
-    "max_position_if_score4": 0.50,      # 4分 → 50%
-    "max_position_if_score3_above_ma5": 0.30,  # 3分+MA5上方 → 30%
-    "max_position_if_score3_below_ma5": 0.25,   # 3分+MA5下方 → 25%
+    "max_position_if_score4": 0.50,
+    "max_position_if_score3_above_ma5": 0.30,
+    "max_position_if_score3_below_ma5": 0.25,
     # RR规则
-    "rr_min": 1.5,          # RR门槛，低于此值直接拒绝
-    "rr_bonus_threshold": 2.0,  # RR>2.0 → 可加仓
-    "rr_bonus_factor": 0.25,    # RR>2.0时额外加仓25%
+    "rr_min": 1.5,
+    "rr_bonus_threshold": 2.0,
+    "rr_bonus_factor": 0.25,
     # 止损
-    "stop_loss_pct": 0.10,    # 止损 = buy1 - R * 10%（区间宽度的10%）
+    "stop_loss_pct": 0.10,    # 区间下方10%
+    "stop_loss_min_pct": 0.01,  # 最小止损空间：1%（失真检测阈值）
     # 频率控制
     "max_trades_per_day": 2,
     "cooldown_minutes": 30,
@@ -128,69 +129,111 @@ class RiskReward:
     sl_price: float             # 止损价
     sl_distance: float          # 止损距离（元）
     tp_distance: float          # 止盈距离（元）
-    verdict: str                # "DO" / "SKIP"
+    verdict: str                # DO / WARN / SKIP
     verdict_reason: str         # 人话原因
-    position_modifier: float    # 仓位修正系数（RR加仓/减仓）
-    stop_loss_pct: float        # 止损比例（相对于buy1）
+    position_modifier: float    # 仓位修正系数
+    stop_loss_pct: float        # 止损比例（%）
+    rr_flag: str = "NORMAL"     # NORMAL / FAKE_RR / SUSPICIOUS
 
 
-def calc_risk_reward(buy1: float, sell1: float, H: float, L: float) -> RiskReward:
+def calc_risk_reward(buy1: float, sell1: float, H: float, L: float,
+                     above_ma5: bool = True) -> RiskReward:
     """
     计算RR（盈亏比）和自动止损
     ==============================
-    止损 = buy1 - R * 10%  （区间下方10%处）
-    止盈 = sell1           （区间上方）
-    RR   = tp_distance / sl_distance
+    止损 = buy1 - R * 10%，但必须保证最小1%空间（否则拓宽）
+
+    RR质量检测：
+    - 止损距离 < 0.8% 价格 → FAKE_RR（失真）
+    - RR > 5 → SUSPICIOUS（高概率失真）
+    - 趋势向下时 → 即使RR高也不能加仓
 
     决策：
-    - RR < 1.5  → SKIP（不划算）
-    - RR 1.5~2.0 → 正常仓位
-    - RR > 2.0  → 可加仓25%
+    - RR < 1.5  → SKIP
+    - RR失真   → SKIP 或 降仓70%
+    - RR正常   → 正常仓位
+    - RR>2 + 趋势向上 → 可加仓
+    - RR>2 + 趋势向下 → 不加仓
     """
     R = H - L
-    sl_price = round(buy1 - R * GATE_RULES["stop_loss_pct"], 2)
+    raw_sl = buy1 - R * GATE_RULES["stop_loss_pct"]
+    raw_sl_dist = abs(buy1 - raw_sl)
+    raw_sl_pct = raw_sl_dist / buy1
+
+    # ── 确保最小止损空间（1%）──
+    min_sl_dist = buy1 * GATE_RULES["stop_loss_min_pct"]
+    if raw_sl_dist < min_sl_dist:
+        sl_price = round(buy1 - min_sl_dist, 2)
+        sl_dist = min_sl_dist
+        widen_note = "(已拓宽至1%)"
+    else:
+        sl_price = round(raw_sl, 2)
+        sl_dist = raw_sl_dist
+        widen_note = ""
+
     tp_price = sell1
-
-    sl_distance = abs(buy1 - sl_price)
     tp_distance = abs(tp_price - buy1)
+    sl_pct = sl_dist / buy1
 
-    if sl_distance <= 0:
-        # 区间太窄，无法计算有效止损
+    if sl_dist <= 0:
         return RiskReward(
             rr=0.0, tp_price=tp_price, sl_price=sl_price,
             sl_distance=0.0, tp_distance=tp_distance,
-            verdict="SKIP", verdict_reason="区间过窄，无有效止损",
-            position_modifier=0.0, stop_loss_pct=0.0
+            verdict="SKIP", verdict_reason="区间过窄，无法计算有效止损",
+            position_modifier=0.0, stop_loss_pct=sl_pct,
+            rr_flag="NORMAL",
         )
 
-    rr = tp_distance / sl_distance
+    rr = tp_distance / sl_dist
 
-    # 决策
+    # ── RR质量检测（核心修正）──
+    rr_ratio = sl_dist / buy1  # 止损占价格比
+    if rr_ratio < 0.008:
+        rr_flag = "FAKE_RR"
+    elif rr > 5:
+        rr_flag = "SUSPICIOUS"
+    else:
+        rr_flag = "NORMAL"
+
+    # ── 决策（趋势权重 > RR权重）──
     if rr < GATE_RULES["rr_min"]:
         verdict = "SKIP"
         verdict_reason = "RR %.1f < %.1f，不划算" % (rr, GATE_RULES["rr_min"])
         position_modifier = 0.0
+    elif rr_flag == "FAKE_RR":
+        verdict = "WARN"
+        verdict_reason = ("RR %.1f 失真（止损仅%.1f%%，小于0.8%%）" % (rr, rr_ratio * 100)) + widen_note
+        position_modifier = -0.30  # 降30%仓位
+    elif rr_flag == "SUSPICIOUS":
+        verdict = "WARN"
+        verdict_reason = ("RR %.1f 可疑（>5通常失真，止损过近）" % rr) + widen_note
+        position_modifier = 0.0    # 不加不减
     elif rr >= GATE_RULES["rr_bonus_threshold"]:
-        verdict = "DO"
-        verdict_reason = "RR %.1f > %.1f，优质信号，可加仓" % (
-            rr, GATE_RULES["rr_bonus_threshold"])
-        position_modifier = GATE_RULES["rr_bonus_factor"]   # +25%
+        if not above_ma5:
+            # 趋势向下：RR高也不加仓，只当正常信号处理
+            verdict = "DO"
+            verdict_reason = ("RR %.1f 优秀但逆趋势，不加仓" % rr) + widen_note
+            position_modifier = 0.0
+        else:
+            verdict = "DO"
+            verdict_reason = ("RR %.1f 优质，趋势向上，可加仓" % rr) + widen_note
+            position_modifier = GATE_RULES["rr_bonus_factor"]
     else:
         verdict = "DO"
-        verdict_reason = "RR %.1f 在正常区间（%.1f~%.1f）" % (
-            rr, GATE_RULES["rr_min"], GATE_RULES["rr_bonus_threshold"])
+        verdict_reason = ("RR %.1f 正常" % rr) + widen_note
         position_modifier = 0.0
 
     return RiskReward(
         rr=rr,
         tp_price=tp_price,
         sl_price=sl_price,
-        sl_distance=sl_distance,
-        tp_distance=tp_distance,
+        sl_distance=round(sl_dist, 2),
+        tp_distance=round(tp_distance, 2),
         verdict=verdict,
         verdict_reason=verdict_reason,
         position_modifier=position_modifier,
-        stop_loss_pct=GATE_RULES["stop_loss_pct"],
+        stop_loss_pct=round(sl_pct * 100, 2),  # 百分比
+        rr_flag=rr_flag,
     )
 
 
@@ -301,7 +344,7 @@ def calc_signal_gate(snap: MarketSnapshot, df: pd.DataFrame | None = None) -> di
     sell1 = round(M + 0.4 * R, 2)
     sell2 = round(M + 0.6 * R, 2)
 
-    rr_result = calc_risk_reward(buy1, sell1, H, L)
+    rr_result = calc_risk_reward(buy1, sell1, H, L, above_ma5=above_ma5)
 
     # ── 频率检查 ──
     freq_status = _freq_ctrl.get_status(code)
@@ -344,7 +387,7 @@ def calc_signal_gate(snap: MarketSnapshot, df: pd.DataFrame | None = None) -> di
         human_verdict = "[SKIP] " + str(reject)
 
     gate_result = GateResult(
-        passed=passed,
+        passed=reject is None,
         score=score,
         max_score=4,
         reject_reason=reject,
@@ -360,9 +403,11 @@ def calc_signal_gate(snap: MarketSnapshot, df: pd.DataFrame | None = None) -> di
         rr_result=rr_result,
     )
 
+    signal_passed = gate_result.passed   # 避免与返回字典的gate_passed字段冲突
+
     return {
         # 门禁
-        "gate_passed": gate_result.passed,
+        "gate_passed": signal_passed,
         "score": gate_result.score,
         "max_score": gate_result.max_score,
         "reject_reason": gate_result.reject_reason,
@@ -391,12 +436,13 @@ def calc_signal_gate(snap: MarketSnapshot, df: pd.DataFrame | None = None) -> di
 
         # RR + 止损
         "rr": round(rr_result.rr, 2) if rr_result else 0.0,
+        "rr_flag": getattr(rr_result, "rr_flag", "NORMAL"),
+        "rr_verdict": rr_result.verdict if rr_result else "SKIP",
+        "rr_reason": rr_result.verdict_reason if rr_result else "",
         "tp_price": rr_result.tp_price if rr_result else 0.0,
         "sl_price": rr_result.sl_price if rr_result else 0.0,
         "sl_distance": round(rr_result.sl_distance, 2) if rr_result else 0.0,
         "tp_distance": round(rr_result.tp_distance, 2) if rr_result else 0.0,
-        "rr_verdict": rr_result.verdict if rr_result else "SKIP",
-        "rr_reason": rr_result.verdict_reason if rr_result else "",
         "stop_loss_pct": rr_result.stop_loss_pct if rr_result else 0.0,
 
         # 人话结论
