@@ -1,43 +1,100 @@
 """
-回测引擎（支持v3.0 Signal Gate）
+回测引擎 v3.1（基于统一行情层）
 """
 import pandas as pd
+from market_data import MarketSnapshot, get_daily_df, fetch_market_snapshot
 from signal_gate import calc_signal_gate, GATE_RULES
-from config import BACKTEST_INITIAL_CASH, BACKTEST_START_DAYS_AGO
 
 
-def backtest(df: pd.DataFrame, stock_name: str = "标的", use_gate: bool = True) -> dict:
+def backtest(df: pd.DataFrame, stock_name: str = "标的",
+             snap: MarketSnapshot = None, use_gate: bool = True) -> dict:
     """
-    日内区间触发回测（支持v3.0门禁系统）
+    v3.1 日内触发回测（使用MarketSnapshot口径）
     """
+    lookback = 55  # 交易日窗口
     amp_th = GATE_RULES["amplitude_min"]
-    lookback = BACKTEST_START_DAYS_AGO
 
     if len(df) < lookback:
-        return {"error": f"数据不足，仅有{len(df)}条"}
+        return {"error": f"数据不足（{len(df)}条 < {lookback}条）"}
 
     df_test = df.tail(lookback).reset_index(drop=True)
 
-    cash = BACKTEST_INITIAL_CASH
+    cash = 100000.0
     position = 0
-    cost_basis = 0
+    cost_basis = 0.0
     trades = []
     equity_curve = []
 
     for i in range(5, len(df_test)):
-        sub = df_test.iloc[:i+1]
         latest = df_test.iloc[i]
         day = latest["date"].strftime("%Y-%m-%d") if hasattr(latest["date"], "strftime") else str(latest["date"])
 
         if use_gate:
-            sig = calc_signal_gate(sub, amp_th)
+            # 构建模拟snap（使用历史数据，保证口径统一）
+            from dataclasses import dataclass
+            @dataclass
+            class MockSnap:
+                code: str
+                name: str
+                fetched_at: float
+                prev_close: float
+                open: float
+                high: float
+                low: float
+                close: float
+                volume: float
+                amplitude: float
+                pct_change: float
+                current_price: float
+                price_source: str
+                is_realtime: bool
+                data_date: str
+                data_age_minutes: float
+                fetch_success: bool
+                error_msg: str
+
+                @property
+                def is_expired(self): return False
+                @property
+                def age_display(self): return "历史数据"
+                @property
+                def reference_price(self): return self.current_price
+                @property
+                def price_for_gate(self): return self.close
+                @property
+                def price_for_signal(self): return self.close
+
+                def to_dict(self): return {}
+
+            m = MockSnap(
+                code="",
+                name=stock_name,
+                fetched_at=0,
+                prev_close=float(latest.get("close", latest["close"])),
+                open=float(latest["open"]),
+                high=float(latest["high"]),
+                low=float(latest["low"]),
+                close=float(latest["close"]),
+                volume=float(latest["volume"]),
+                amplitude=float(latest["amplitude"]) if "amplitude" in latest else 0.0,
+                pct_change=float(latest.get("pct_change", 0)),
+                current_price=float(latest["close"]),
+                price_source="历史日线",
+                is_realtime=False,
+                data_date=day,
+                data_age_minutes=0.0,
+                fetch_success=True,
+                error_msg=""
+            )
+            sig = calc_signal_gate(m, df_test.iloc[:i+1])
         else:
             from strategy import calc_signal as old_calc
-            res = old_calc(sub, amp_th)
+            res = old_calc(df_test.iloc[:i+1], amp_th)
             sig = {**res, "gate_passed": res["do_trade"]}
 
         if not sig.get("gate_passed", False):
-            equity_curve.append({"date": day, "equity": round(cash + position * latest["close"], 2)})
+            equity = cash + position * latest["close"]
+            equity_curve.append({"date": day, "equity": round(equity, 2), "action": None})
             continue
 
         buy_price = sig["buy"][0]
@@ -57,7 +114,7 @@ def backtest(df: pd.DataFrame, stock_name: str = "标的", use_gate: bool = True
                 position += qty
                 trades.append({
                     "date": day, "action": "BUY", "price": buy_price,
-                    "qty": qty, "reason": f"低点触发 ≤ {buy_price}"
+                    "qty": qty, "reason": f"低点触发 ≤{buy_price}"
                 })
                 bought = True
 
@@ -68,7 +125,7 @@ def backtest(df: pd.DataFrame, stock_name: str = "标的", use_gate: bool = True
             trades.append({
                 "date": day, "action": "SELL", "price": sell_price,
                 "qty": position, "profit": round(profit, 2),
-                "reason": f"高点触发 ≥ {sell_price}"
+                "reason": f"高点触发 ≥{sell_price}"
             })
             position = 0
             sold = True
@@ -81,8 +138,11 @@ def backtest(df: pd.DataFrame, stock_name: str = "标的", use_gate: bool = True
         })
 
     # 汇总
+    if not equity_curve:
+        return {"error": "无有效交易日"}
+
     df_eq = pd.DataFrame(equity_curve)
-    total_return = (df_eq["equity"].iloc[-1] - BACKTEST_INITIAL_CASH) / BACKTEST_INITIAL_CASH * 100
+    total_return = (df_eq["equity"].iloc[-1] - 100000.0) / 100000.0 * 100
     df_eq["peak"] = df_eq["equity"].cummax()
     df_eq["drawdown"] = (df_eq["equity"] - df_eq["peak"]) / df_eq["peak"] * 100
     max_drawdown = df_eq["drawdown"].min()
@@ -98,7 +158,7 @@ def backtest(df: pd.DataFrame, stock_name: str = "标的", use_gate: bool = True
         "trading_days": len(df_eq),
         "total_return_pct": round(total_return, 2),
         "final_equity": round(df_eq["equity"].iloc[-1], 2),
-        "initial_cash": BACKTEST_INITIAL_CASH,
+        "initial_cash": 100000.0,
         "max_drawdown_pct": round(max_drawdown, 2),
         "total_trades": len([t for t in trades if t["action"] == "BUY"]),
         "sell_trades": len(sell_trades),
@@ -115,7 +175,7 @@ def print_backtest_report(result: dict):
         print(f"  ⚠️ {result['error']}")
         return
     print(f"\n{'='*50}")
-    print(f"  📊 回测报告（v3.0门禁）：{result['stock']}")
+    print(f"  📊 回测报告（v3.1统一行情层）：{result['stock']}")
     print(f"{'='*50}")
     print(f"  区间：{result['start_date']} → {result['end_date']}")
     print(f"  交易日数：{result['trading_days']} 天")
