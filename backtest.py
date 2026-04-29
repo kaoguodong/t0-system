@@ -6,10 +6,11 @@ from market_data import MarketSnapshot, get_daily_df, fetch_market_snapshot
 from signal_gate import calc_signal_gate, GATE_RULES
 
 
-def backtest(df: pd.DataFrame, stock_name: str = "标的",
-             snap: MarketSnapshot = None, use_gate: bool = True) -> dict:
+def backtest(df: pd.DataFrame, stock_name: str = "",
+             snap: MarketSnapshot = None, use_gate: bool = True,
+             use_rr: bool = True) -> dict:
     """
-    v3.1 日内触发回测（使用MarketSnapshot口径）
+    回测引擎 v3.3（RR盈亏比过滤已内置于calc_signal_gate）
     """
     lookback = 55  # 交易日窗口
     amp_th = GATE_RULES["amplitude_min"]
