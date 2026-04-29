@@ -1,4 +1,4 @@
-akshare
+akshare==1.12.0
 pandas
 numpy
 requests
