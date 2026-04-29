@@ -1,0 +1,7 @@
+# Python cache files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Specific cache file mentioned
+__pycache__/backtest.cpython-311.pyc
