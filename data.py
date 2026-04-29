@@ -36,7 +36,7 @@ def get_daily_df(code: str, days: int = 60) -> pd.DataFrame:
 
     df = pd.DataFrame(data_list, columns=[
         "date", "open", "high", "low", "close", "volume", "amount", "pct_change"
-    })
+    ])
 
     # 类型转换
     for col in ["open", "high", "low", "close", "volume", "amount", "pct_change"]:
