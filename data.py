@@ -3,7 +3,7 @@ import requests
 from datetime import datetime, timedelta
 
 # Tushare Token（请替换为您的token，或使用下面的demo token）
-TUSHARE_TOKEN = "2a6af9c37d8f2c2f5d54e7c9a3b7e6f1d4c8a2b5e6f7g3h9i0j1k2l3m4n5o6p"
+TUSHARE_TOKEN = "d756d9218d4665c7c38f1b539446b05d1504c7df637e8e90e30bc6ea"
 
 TUSHARE_BASE = "http://api.tushare.pro"
 
